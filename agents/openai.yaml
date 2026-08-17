@@ -1,0 +1,7 @@
+interface:
+  display_name: "Paistar MCO Orchestrator"
+  short_description: "Route multi-model sub-agents with evidence checks"
+  default_prompt: "Use $paistar-mco-orchestrator to route this task to the right read-only sub-agents."
+
+policy:
+  allow_implicit_invocation: true
