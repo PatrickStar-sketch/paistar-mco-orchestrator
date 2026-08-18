@@ -78,16 +78,46 @@ function filesUnder(target) {
   return files;
 }
 
-function manifest(repo, paths) {
+function snapshot(repo, paths) {
   const rows = [];
   for (const path of paths) {
     const resolved = safePath(repo, path);
     for (const file of filesUnder(resolved.target)) {
       const content = readFileSync(file);
-      rows.push({ path: relative(resolve(repo), file), sha256: createHash('sha256').update(content).digest('hex').slice(0, 16) });
+      const relativePath = relative(resolve(repo), file);
+      rows.push({
+        path: relativePath,
+        sha256: createHash('sha256').update(content).digest('hex').slice(0, 16),
+        content: content.includes(0) ? null : content.toString('utf8'),
+      });
     }
   }
   return rows;
+}
+
+function withProjectContext(repo, paths) {
+  const context = ['MCO_CONTEXT.md'];
+  return [...new Set([...context.filter((path) => existsSync(resolve(repo, path))), ...paths])];
+}
+
+function manifest(rows) {
+  return rows.map(({ path, sha256 }) => ({ path, sha256 }));
+}
+
+function boundedContents(rows) {
+  const perFileLimit = 12000;
+  const totalLimit = 60000;
+  let remaining = totalLimit;
+  const sections = [];
+  for (const row of rows) {
+    if (!row.content || remaining <= 0) continue;
+    const text = row.content.slice(0, Math.min(perFileLimit, remaining));
+    const truncated = text.length < row.content.length;
+    const numbered = text.split(/\r?\n/).map((line, index) => `${String(index + 1).padStart(4, ' ')} | ${line}`).join('\n');
+    sections.push(`--- ${row.path}${truncated ? ' (truncated)' : ''} ---\n${numbered}`);
+    remaining -= text.length;
+  }
+  return sections.join('\n\n') || '(no readable text files in snapshot)';
 }
 
 function routeFor(options) {
@@ -117,8 +147,40 @@ function run(command, args, cwd) {
 
 function buildPrompt(options, route, rows) {
   const header = `__MCO_OPTIONS__ model=${route.model} ${route.levelKey}=${route.level}`;
-  const evidence = rows.map((row) => `${row.path}#${row.sha256}`).join(', ');
-  return `${header}\nRepository snapshot manifest: ${evidence || '(empty)'}\n${options.prompt}\nOnly inspect the supplied snapshot. Return evidence-backed findings with repository-relative paths. Do not modify files, install dependencies, start services, or access production.`;
+  const evidence = manifest(rows).map((row) => `${row.path}#${row.sha256}`).join(', ');
+  return `${header}\nRepository snapshot manifest: ${evidence || '(empty)'}\nRepository snapshot contents (authoritative; line numbers are included):\n${boundedContents(rows)}\n${options.prompt}\nOnly inspect the supplied snapshot contents. Do not call tools or infer absent files. Return evidence-backed findings with repository-relative paths and line numbers. Do not modify files, install dependencies, start services, or access production.`;
+}
+
+function validateResult(result, options, rows) {
+  if (!result.ok) return result;
+  let envelope;
+  try {
+    envelope = JSON.parse(result.stdout);
+  } catch {
+    return { ...result, ok: false, validation_error: 'mco returned non-JSON output' };
+  }
+  const outputs = Array.isArray(envelope?.outputs) ? envelope.outputs : [];
+  const successful = outputs.filter((output) => output && output.status === 'success');
+  if (!successful.length) {
+    return { ...result, ok: false, validation_error: 'provider completed without a successful output' };
+  }
+  const gateEvidence = !/健康检查|health\s*check|只输出一行|one line/i.test(options.prompt);
+  const manifestPaths = rows.map((row) => row.path);
+  for (const output of successful) {
+    const text = typeof output.output === 'string' ? output.output.trim() : '';
+    if (!text) return { ...result, ok: false, validation_error: 'provider exited successfully but returned empty output' };
+    const progressOnly = text.split(/\r?\n/).length <= 2
+      && /^(收到|我先|我将|我会|正在|先读取|开始|已收到|I(?:'|’)ll|I will|Let me|I’m going|I've received)/i.test(text);
+    if (progressOnly) return { ...result, ok: false, validation_error: 'provider returned progress text without a final answer' };
+    if (gateEvidence) {
+      const hasPath = manifestPaths.some((path) => text.includes(path));
+      const hasLine = /(?:\bline|\b行(?:号)?)\s*[/：:#-]?\s*\d+|\bL\s*\d+|[A-Za-z0-9_.\/-]+:\d+/i.test(text);
+      if (!hasPath || !hasLine) {
+        return { ...result, ok: false, validation_error: 'provider output lacks snapshot path and line evidence' };
+      }
+    }
+  }
+  return result;
 }
 
 async function main() {
@@ -128,19 +190,25 @@ async function main() {
   if (!options.prompt) throw new Error('--prompt is required');
   const repo = resolve(options.repo);
   if (!existsSync(repo) || !statSync(repo).isDirectory()) throw new Error(`repository is not a directory: ${repo}`);
-  const rows = manifest(repo, options.paths);
+  const rows = snapshot(repo, withProjectContext(repo, options.paths));
   const routes = routeFor(options);
+  // Grok can spend several minutes in a single read-only review before it
+  // emits the final answer. Keep the defaults generous, while allowing a
+  // caller to tighten them for smoke tests without editing this dispatcher.
+  const invocationHardTimeout = process.env.PAISTAR_MCO_INVOCATION_HARD_TIMEOUT || '600';
+  const stallTimeout = process.env.PAISTAR_MCO_STALL_TIMEOUT || '600';
   const baseArgs = [
     '@tt-a1i/mco@latest', 'run', '--repo', repo,
     '--target-paths', options.paths.join(','), '--allow-paths', options.paths.join(','),
-    '--execution-mode', 'read_only', '--invocation-hard-timeout', '300', '--stall-timeout', '240', '--json',
+    '--execution-mode', 'read_only', '--invocation-hard-timeout', invocationHardTimeout, '--stall-timeout', stallTimeout, '--json',
   ];
   if (options.dryRun) baseArgs.push('--dry-run');
   const jobs = routes.map((route) => ({ route, args: [...baseArgs, '--providers', route.provider, '--prompt', buildPrompt(options, route, rows)] }));
-  const results = options.parallel || routes.length > 1
+  const rawResults = options.parallel || routes.length > 1
     ? await Promise.all(jobs.map((job) => run('npx', jobsToArgs(job), repo)))
     : [await run('npx', jobsToArgs(jobs[0]), repo)];
-  console.log(JSON.stringify({ ok: results.every((result) => result.ok), repo, task: options.task, manifest: rows, routes, results }, null, 2));
+  const results = rawResults.map((result) => validateResult(result, options, rows));
+  console.log(JSON.stringify({ ok: results.every((result) => result.ok), repo, task: options.task, manifest: manifest(rows), routes, results }, null, 2));
   if (results.some((result) => !result.ok)) process.exitCode = 1;
 }
 
