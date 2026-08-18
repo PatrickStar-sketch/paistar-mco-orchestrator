@@ -95,6 +95,11 @@ function snapshot(repo, paths) {
   return rows;
 }
 
+function withProjectContext(repo, paths) {
+  const context = ['MCO_CONTEXT.md'];
+  return [...new Set([...context.filter((path) => existsSync(resolve(repo, path))), ...paths])];
+}
+
 function manifest(rows) {
   return rows.map(({ path, sha256 }) => ({ path, sha256 }));
 }
@@ -185,7 +190,7 @@ async function main() {
   if (!options.prompt) throw new Error('--prompt is required');
   const repo = resolve(options.repo);
   if (!existsSync(repo) || !statSync(repo).isDirectory()) throw new Error(`repository is not a directory: ${repo}`);
-  const rows = snapshot(repo, options.paths);
+  const rows = snapshot(repo, withProjectContext(repo, options.paths));
   const routes = routeFor(options);
   // Grok can spend several minutes in a single read-only review before it
   // emits the final answer. Keep the defaults generous, while allowing a

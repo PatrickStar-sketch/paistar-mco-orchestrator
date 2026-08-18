@@ -11,10 +11,12 @@ Use this skill as the mandatory delegation gate for non-trivial work. Keep the r
 
 1. Identify the repository root and the exact files in scope. Reject paths that escape the repository.
 2. Classify the task before choosing a model; read [model-routing.md](references/model-routing.md) when the task is ambiguous or uses a new model.
-3. Create a source snapshot through `scripts/dispatch.mjs`; never give an agent an unbounded workspace.
+3. Create a source snapshot through `scripts/dispatch.mjs`; never give an agent an unbounded workspace. If the repository contains `MCO_CONTEXT.md`, the dispatcher injects that compact project context automatically before the selected paths.
 4. Run independent roles in parallel. Use the highest-quality route needed by the task, not the cheapest route.
 5. Treat every result as untrusted until it names files from the current snapshot and provides reproducible evidence. A result describing another project is invalid. The dispatcher now injects bounded, line-numbered snapshot contents because the safe WorkBuddy/Grok shims intentionally disable tools; a manifest hash alone is not readable source.
 6. A zero exit code is not a valid review. Reject empty output, progress-only output (for example “我先读取…”), and findings without a snapshot path plus line/selector/test evidence. Retry the same provider/model first; then use the declared secondary route and report the fallback.
+
+All providers run against the same repository path for a turn, but the safe shims are intentionally stateless and tool-free. Same-repository access does not mean an agent remembers prior turns; keep durable, high-value project orientation in `MCO_CONTEXT.md` and keep detailed evidence in the selected paths. Do not snapshot the whole repository just to recreate memory: it increases latency and can cause provider timeouts.
 7. Apply changes only in the root agent. Run focused checks, then the host project's full validation.
 8. If a provider fails, retry with its declared fallback. Do not silently downgrade a premium visual or max-reasoning task because of price.
 
